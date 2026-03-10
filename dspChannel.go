@@ -1,5 +1,7 @@
 package resound
 
+import "sync"
+
 // DSPChannel represents an audio channel that can have various effects applied to it.
 // Any Players that have a DSPChannel set will take on the effects applied to the channel as well.
 type DSPChannel struct {
@@ -8,6 +10,7 @@ type DSPChannel struct {
 	effectOrder []IEffect
 	closed      bool
 
+	mu             sync.RWMutex
 	playingPlayers []*Player
 }
 
@@ -40,30 +43,55 @@ func (d *DSPChannel) Effect(id any) IEffect {
 }
 
 func (d *DSPChannel) addPlayerToList(p *Player) {
-	p.dspChannel.playingPlayers = append(p.dspChannel.playingPlayers, p)
+	d.mu.Lock()
+	d.playingPlayers = append(d.playingPlayers, p)
+	d.mu.Unlock()
 }
 
 func (d *DSPChannel) clean() {
+	// Snapshot the slice under read lock to find a non-playing player.
+	d.mu.RLock()
+	snapshot := make([]*Player, len(d.playingPlayers))
+	copy(snapshot, d.playingPlayers)
+	d.mu.RUnlock()
 
-	for i := len(d.playingPlayers) - 1; i >= 0; i-- {
-		if !d.playingPlayers[i].IsPlaying() {
-			d.playingPlayers[i] = nil
-			d.playingPlayers = append(d.playingPlayers[:i], d.playingPlayers[i+1:]...)
-			return
+	var target *Player
+	for _, p := range snapshot {
+		if !p.IsPlaying() {
+			target = p
+			break
 		}
 	}
 
+	if target == nil {
+		return
+	}
+
+	// Take write lock and remove by pointer identity in the current slice.
+	d.mu.Lock()
+	for i, p := range d.playingPlayers {
+		if p == target {
+			d.playingPlayers[i] = nil
+			d.playingPlayers = append(d.playingPlayers[:i], d.playingPlayers[i+1:]...)
+			break
+		}
+	}
+	d.mu.Unlock()
 }
 
 // PlayingPlayers returns a copy of the list of all Players currently playing through the DSPChannel.
 func (d *DSPChannel) PlayingPlayers() []*Player {
-	out := []*Player{}
+	d.mu.RLock()
+	out := make([]*Player, len(d.playingPlayers))
 	copy(out, d.playingPlayers)
+	d.mu.RUnlock()
 	return out
 }
 
 // PlayerByID returns a specific Player by its ID.
 func (d *DSPChannel) PlayerByID(id any) *Player {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	for _, p := range d.playingPlayers {
 		if p.id == id {
 			return p
@@ -75,7 +103,13 @@ func (d *DSPChannel) PlayerByID(id any) *Player {
 // IsPlayingPlayer returns if a Player with the specified ID is currently playing back.
 func (d *DSPChannel) IsPlayingPlayer(id any) bool {
 	d.clean()
-	for _, player := range d.playingPlayers {
+
+	d.mu.RLock()
+	snapshot := make([]*Player, len(d.playingPlayers))
+	copy(snapshot, d.playingPlayers)
+	d.mu.RUnlock()
+
+	for _, player := range snapshot {
 		if player.IsPlaying() && player.id == id {
 			return true
 		}
